@@ -1,32 +1,29 @@
-from flask import Flask
-from threading import Thread
-
-# ================= KEEP ALIVE =================
-app_web = Flask('')
-
-@app_web.route('/')
-def home():
-    return "Bot is running!"
-
-def run():
-    app_web.run(host='0.0.0.0', port=10000)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# ================= ORIGINAL CODE =================
+import asyncio
 import requests
 import time
 import csv
 import os
 from bs4 import BeautifulSoup
+from flask import Flask
+from threading import Thread
+import threading # নতুন থ্রেডিং লাইব্রেরি
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-TOKEN = "8643223258:AAF2qByjhoWCUhgWqv1_zWkoaHMx6anPwXg"
+# ================= KEEP ALIVE =================
+app_web = Flask('')
+@app_web.route('/')
+def home(): return "Bot is running!"
+def run(): app_web.run(host='0.0.0.0', port=10000)
+def keep_alive(): Thread(target=run).start()
+
+# ================= CONFIGURATION =================
+TOKEN = "8643223258:AAF2qByjhoWCUhgWqv1_zWkoaHMx6anPwXg" 
 FILE_NAME = "data.csv"
 
+# এটিই আপনার স্টপ বাটনকে সুপারফাস্ট করবে
+user_stop_event = {} 
+user_search_active = {}
 last_range = {}
 
 def init_file():
@@ -34,199 +31,154 @@ def init_file():
         with open(FILE_NAME, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["Name","Roll","Board","Mobile","Date","TranID"])
 
-def is_duplicate(tran_id):
-    if not os.path.exists(FILE_NAME):
-        return False
-    with open(FILE_NAME, "r", encoding="utf-8") as f:
-        return any(tran_id in row for row in f)
-
 def save_data(name, roll, board, mobile, date, tran_id):
-    if is_duplicate(tran_id):
-        return
     with open(FILE_NAME, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([name, roll, board, mobile, date, tran_id])
 
+# ----------------- ডাটা ফেচিং -----------------
 def get_tran_ids(roll):
     url = f"https://billpay.sonalibank.com.bd/BoardRescrutiny/Home/Search?searchStr={roll}"
-    res = requests.get(url)
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    ids = []
     try:
-        rows = soup.find("table").find_all("tr")[1:]
-        for r in rows:
-            ids.append(r.find_all("td")[1].text.strip())
-    except:
-        pass
-
-    return ids
+        res = requests.get(url, timeout=5)
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table")
+        if not table: return []
+        return [r.find_all("td")[1].text.strip() for r in table.find_all("tr")[1:]]
+    except: return []
 
 def get_full_data(tran_id):
     url = f"https://billpay.sonalibank.com.bd/BoardRescrutiny/Home/Voucher/{tran_id}"
-    res = requests.get(url)
-    soup = BeautifulSoup(res.text, "html.parser")
-
     try:
+        res = requests.get(url, timeout=5)
+        soup = BeautifulSoup(res.text, "html.parser")
         lines = [l.strip() for l in soup.get_text("\n").split("\n") if l.strip()]
-
         def find(label):
             for i in range(len(lines)):
-                if label in lines[i]:
-                    return lines[i+1]
-            return "Not found"
-
-        name = find("Name")
-        roll = find("Roll")
-        board = find("Board")
-        mobile = find("Mobile")
-        date = find("Date")
-
+                if label in lines[i]: return lines[i+1]
+            return "N/A"
+        name, roll, board, mobile, date = find("Name"), find("Roll"), find("Board"), find("Mobile"), find("Date")
         save_data(name, roll, board, mobile, date, tran_id)
-
-        text = f"""<pre>
-Name   : {name}
-Roll   : {roll}
-Board  : {board}
-Mobile : {mobile}
-Date   : {date}
-ID     : {tran_id}
-</pre>"""
-
+        text = f"<pre>\nName   : {name}\nRoll   : {roll}\nBoard  : {board}\nMobile : {mobile}\nDate   : {date}\nID     : {tran_id}\n</pre>"
         return text, mobile
-    except:
-        return None, None
+    except: return None, None
 
-def format_number_bd(mobile):
-    n = mobile.replace("+","").replace(" ","")
-    if n.startswith("01"):
-        return "880"+n[1:]
-    if n.startswith("880"):
-        return n
-    return None
+# ----------------- বাটন -----------------
+def stop_button():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop Search", callback_data="stop_search")]])
+
+def next_button(num):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"➡️ Next {num}", callback_data="next_range")]])
 
 def get_contact_buttons(mobile):
-    n = format_number_bd(mobile)
-    if not n:
-        return None
+    n = mobile.replace("+","").replace(" ","")
+    if n.startswith("01"): n = "880"+n[1:]
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📱 WhatsApp", url=f"https://wa.me/{n}"), InlineKeyboardButton("✈️ Telegram", url=f"https://t.me/+{n}")]])
 
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📱 WhatsApp", url=f"https://wa.me/{n}"),
-        InlineKeyboardButton("✈️ Telegram", url=f"https://t.me/+{n}")
-    ]])
+# ----------------- কোর সার্চ ইঞ্জিন -----------------
+async def run_search(message, context, start, end):
+    user_id = message.chat_id
+    
+    if user_search_active.get(user_id, False):
+        await message.reply_text("⚠️ একটি সার্চ ইতিমধ্যে চলছে!")
+        return
 
-def next_button():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➡️ Next 50", callback_data="next50")]
-    ])
-
-def get_keyboard():
-    return ReplyKeyboardMarkup(
-        [["🚀 Start"],["📂 Search Database"],["📥 Download Data"]],
-        resize_keyboard=True
-    )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome!", reply_markup=get_keyboard())
-
-async def run_range(message, context, start, end):
-    status = await message.reply_text("⏳ Processing...")
+    user_search_active[user_id] = True
+    user_stop_event[user_id] = False # স্টপ ইভেন্ট রিসেট
+    
+    status_msg = await message.reply_text("⏳ সার্চ শুরু হচ্ছে...", reply_markup=stop_button())
     count = 0
+    total = end - start + 1
 
-    for roll in range(start, end+1):
-        await status.edit_text(f"⏳ Processing...\n🔢 Roll: {roll}\n📊 Found: {count}")
+    try:
+        for i, roll in enumerate(range(start, end+1), 1):
+            # একদম সাথে সাথে চেক
+            if user_stop_event.get(user_id, False): break
 
-        for tid in get_tran_ids(roll):
-            data, mobile = get_full_data(tid)
+            found_now = False
+            tids = get_tran_ids(roll)
+            for tid in tids:
+                if user_stop_event.get(user_id, False): break
+                data, mobile = get_full_data(tid)
+                if data:
+                    count += 1
+                    found_now = True
+                    try: await status_msg.delete()
+                    except: pass
+                    
+                    await message.reply_text(f"📄 Result {count}:\n{data}", parse_mode="HTML", reply_markup=get_contact_buttons(mobile))
+                    status_msg = await message.reply_text(f"⏳ Processing...\n🔢 Roll: {roll}\n📊 Found: {count}\n✅ Progress: {i}/{total}", reply_markup=stop_button())
 
-            if data:
-                count += 1
-                await message.reply_text(
-                    f"📄 Result {count}:\n{data}",
-                    parse_mode="HTML",
-                    reply_markup=get_contact_buttons(mobile)
-                )
+            if not found_now and (i % 3 == 0 or i == total):
+                if user_stop_event.get(user_id, False): break
+                try:
+                    await status_msg.edit_text(f"⏳ Processing...\n🔢 Roll: {roll}\n📊 Found: {count}\n✅ Progress: {i}/{total}", reply_markup=stop_button())
+                except: pass
 
-        time.sleep(2)
+            # ২ সেকেন্ড ওয়েট করার সময়ও যেন স্টপ বাটন কাজ করে
+            for _ in range(20):
+                if user_stop_event.get(user_id, False): break
+                await asyncio.sleep(0.1)
+                
+    finally:
+        was_stopped = user_stop_event.get(user_id, False)
+        user_search_active[user_id] = False
+        try: await status_msg.delete()
+        except: pass
+        
+        if was_stopped:
+            await message.reply_text(f"🛑 Search Stopped!\n📊 Total Found: {count}")
+        else:
+            await message.reply_text(f"✅ Done!\n📊 Total: {count}")
+            await message.reply_text(f"👉 Next {total}?", reply_markup=next_button(total))
 
-    await status.edit_text(f"✅ Done!\n📊 Total: {count}")
-    await message.reply_text("👉 Next 50?", reply_markup=next_button())
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----------------- হ্যান্ডলারস -----------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.message.from_user.id
 
     if text == "🚀 Start":
-        await update.message.reply_text("✅ Ready!", reply_markup=get_keyboard())
-        return
-
-    if text == "📂 Search Database":
-        await update.message.reply_text("👉 Roll বা Range দাও (max 50)")
-        return
-
-    if text == "📥 Download Data":
-        if os.path.exists(FILE_NAME):
-            await update.message.reply_document(open(FILE_NAME,"rb"))
-        else:
-            await update.message.reply_text("❌ No data")
-        return
-
-    if text.isdigit():
-        await update.message.reply_text("⏳ Searching...")
-        for i, tid in enumerate(get_tran_ids(int(text)),1):
-            data, mobile = get_full_data(tid)
-            if data:
-                await update.message.reply_text(
-                    f"📄 Result {i}:\n{data}",
-                    parse_mode="HTML",
-                    reply_markup=get_contact_buttons(mobile)
-                )
-        return
-
-    if "-" in text:
+        await update.message.reply_text("✅ Ready!", reply_markup=ReplyKeyboardMarkup([["🚀 Start"],["📂 Search Database"],["📥 Download Data"]], resize_keyboard=True))
+    elif text == "📂 Search Database":
+        await update.message.reply_text("👉 Roll বা Range দিন (Max 500)।")
+    elif text == "📥 Download Data":
+        if os.path.exists(FILE_NAME): await update.message.reply_document(open(FILE_NAME,"rb"))
+        else: await update.message.reply_text("❌ No data")
+    elif text.isdigit():
+        roll = int(text)
+        last_range[user_id] = (roll, roll)
+        await run_search(update.message, context, roll, roll)
+    elif "-" in text:
         try:
-            start_r, end_r = map(int, text.split("-"))
-        except:
-            await update.message.reply_text("❌ Wrong format")
-            return
+            s, e = map(int, text.split("-"))
+            if (e-s+1) > 500: await update.message.reply_text("❌ Max 500 limit")
+            else:
+                last_range[user_id] = (s, e)
+                await run_search(update.message, context, s, e)
+        except: await update.message.reply_text("❌ Format: 1001-1500")
 
-        if (end_r-start_r+1) > 50:
-            await update.message.reply_text("❌ Max 50")
-            return
-
-        last_range[user_id] = (start_r, end_r)
-        await run_range(update.message, context, start_r, end_r)
-        return
-
-    await update.message.reply_text("❌ Invalid input")
-
-async def handle_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
     user_id = query.from_user.id
-
-    if user_id not in last_range:
-        await query.message.reply_text("❌ আগে search করো")
-        return
-
-    start_r, end_r = last_range[user_id]
-    new_start = end_r + 1
-    new_end = end_r + 50
-
-    last_range[user_id] = (new_start, new_end)
-
-    await query.message.reply_text(f"🔄 Auto: {new_start}-{new_end}")
-    await run_range(query.message, context, new_start, new_end)
+    
+    if query.data == "stop_search":
+        user_stop_event[user_id] = True # কমান্ড পাওয়া মাত্রই ট্রু করে দেবে
+        await query.answer("🛑 সার্চ বন্ধ করা হচ্ছে...")
+        await query.edit_message_reply_markup(reply_markup=None)
+    elif query.data == "next_range":
+        await query.answer()
+        s, e = last_range.get(user_id, (0,0))
+        diff = e - s + 1
+        new_s, new_e = e + 1, e + diff
+        last_range[user_id] = (new_s, new_e)
+        await query.message.reply_text(f"🔄 অটো সার্চ: {new_s}-{new_e}")
+        await run_search(query.message, context, new_s, new_e)
 
 # ================= RUN =================
-init_file()
-keep_alive()  # 🔥 THIS IS THE MAGIC
-
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT, handle))
-app.add_handler(CallbackQueryHandler(handle_next))
-
-print("🤖 BOT RUNNING 24/7...")
-app.run_polling()
+if __name__ == '__main__':
+    init_file()
+    keep_alive()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_query))
+    print("🤖 Bot is Online - Stop Button Fix Active...")
+    app.run_polling()
